@@ -1,0 +1,198 @@
+import streamlit as st
+import pandas as pd
+import fitz  # PyMuPDF
+import re
+from datetime import datetime
+from io import StringIO
+
+# ---------- Helper Functions ----------
+def extract_product_data_from_pdf(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = ""
+
+    # Extract text from all pages in the PDF document
+    for page in doc:
+        text += page.get_text("text")
+
+    products = []
+    previous_product_data = None
+
+    pattern = re.compile(
+        r"(?P<product>.+?)\s+2024 Q(?P<q2024>[\d\s]+)\nV(?P<v2024>[\d\.\s]+)\n2025 Q(?P<q2025>[\d\s]+)\nV(?P<v2025>[\d\.\s]+)",
+        re.MULTILINE
+    )
+
+    months = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ]
+
+    for match in pattern.finditer(text):
+        try:
+            name = match.group("product").strip()
+            q2024 = list(map(int, match.group("q2024").split()))
+            v2024 = list(map(float, match.group("v2024").split()))
+            q2025 = list(map(int, match.group("q2025").split()))
+            v2025 = list(map(float, match.group("v2025").split()))
+
+            if previous_product_data:
+                name = previous_product_data["name"]
+                q2024 = previous_product_data["q2024"] + q2024
+                v2024 = previous_product_data["v2024"] + v2024
+                q2025 = previous_product_data["q2025"] + q2025
+                v2025 = previous_product_data["v2025"] + v2025
+                previous_product_data = None
+
+            batch_match = re.search(r"(\d+)[Xx](\d+(?:\.\d+)?)(KG|G|GR)?", name)
+            if batch_match:
+                units, size, unit = batch_match.groups()
+                full_batch = f"{name} {size}{unit.upper() if unit else 'KG'}"
+                weight_group = f"{size}{unit.upper() if unit else 'KG'}"
+            else:
+                single_match = re.search(r"(\d+(?:\.\d+)?)(KG|G|GR)", name)
+                size = single_match.group(1) if single_match else "UNSPEC"
+                unit = single_match.group(2) if single_match else "KG"
+                full_batch = f"{name} {size}{unit.upper()}"
+                weight_group = f"{size}{unit.upper()}"
+
+            for i in range(12):
+                products.append({
+                    "Product": name,
+                    "Batch": full_batch,
+                    "Weight Group": weight_group,
+                    "Month": months[i],
+                    "Month_Num": i + 1,
+                    "Year": 2024,
+                    "Quantity": q2024[i],
+                    "Value": v2024[i]
+                })
+                products.append({
+                    "Product": name,
+                    "Batch": full_batch,
+                    "Weight Group": weight_group,
+                    "Month": months[i],
+                    "Month_Num": i + 1,
+                    "Year": 2025,
+                    "Quantity": q2025[i],
+                    "Value": v2025[i]
+                })
+
+        except Exception as e:
+            print(f"[SKIPPED] Could not parse product entry: {match.group(0)}")
+            print(f"Reason: {e}")
+
+        if name and len(q2024) < 12:
+            previous_product_data = {
+                "name": name,
+                "q2024": q2024,
+                "v2024": v2024,
+                "q2025": q2025,
+                "v2025": v2025
+            }
+
+    return pd.DataFrame(products)
+
+# ---------- Streamlit App ----------
+st.set_page_config(page_title="Batch Sales - Monthly Filter", layout="wide")
+st.title("📦 Sales Comparison by Month")
+
+uploaded_file = st.file_uploader("Upload Product Sales PDF", type="pdf")
+
+if uploaded_file:
+    pdf_bytes = uploaded_file.read()
+    with st.spinner("Extracting data from PDF..."):
+        df = extract_product_data_from_pdf(pdf_bytes)
+
+    if df.empty:
+        st.error("No data extracted. Please check the PDF format.")
+    else:
+        # Group and pivot for comparison
+        group = df.groupby(["Batch", "Weight Group", "Month", "Month_Num", "Year"]).agg({
+            "Quantity": "sum",
+            "Value": "sum"
+        }).reset_index()
+
+        qty_pivot = group.pivot_table(index=["Batch", "Weight Group", "Month", "Month_Num"], columns="Year", values="Quantity", fill_value=0)
+        val_pivot = group.pivot_table(index=["Batch", "Weight Group", "Month", "Month_Num"], columns="Year", values="Value", fill_value=0)
+
+        qty_pivot.columns = [f"{col}_Qty" for col in qty_pivot.columns]
+        val_pivot.columns = [f"{col}_Value" for col in val_pivot.columns]
+
+        comparison_df = pd.merge(qty_pivot, val_pivot, on=["Batch", "Weight Group", "Month", "Month_Num"]).reset_index()
+
+        comparison_df["Quantity Difference"] = comparison_df["2025_Qty"] - comparison_df["2024_Qty"]
+        comparison_df["Value Difference"] = comparison_df["2025_Value"] - comparison_df["2024_Value"]
+
+        comparison_df = comparison_df.rename(columns={
+            "2024_Qty": "Quantity 2024",
+            "2025_Qty": "Quantity 2025",
+            "2024_Value": "Value 2024",
+            "2025_Value": "Value 2025"
+        })
+
+        comparison_df = comparison_df.sort_values(by=["Weight Group", "Month_Num", "Batch"]).reset_index(drop=True)
+
+        # ---- Sorting Loose/Packs/Zero Logic ----
+        def is_loose_item(batch):
+            return bool(re.match(r"(^|\s)1[Xx]\d+(?:\.\d+)?(KG|G|GR)", batch))
+
+        def is_zero_quantity(row):
+            return row["Quantity 2024"] == 0 and row["Quantity 2025"] == 0
+
+        comparison_df["Loose_Flag"] = comparison_df["Batch"].apply(is_loose_item)
+        comparison_df["Zero_Qty_Flag"] = comparison_df.apply(is_zero_quantity, axis=1)
+
+        month_list = comparison_df["Month"].unique().tolist()
+        selected_month = st.selectbox("📅 Select Month to View", sorted(month_list, key=lambda x: datetime.strptime(x, "%B")))
+
+        filtered_df = comparison_df[comparison_df["Month"] == selected_month]
+
+        # Apply final sorting
+        filtered_df = filtered_df.sort_values(
+            by=["Weight Group", "Zero_Qty_Flag", "Loose_Flag", "Batch"],
+            ascending=[True, True, False, True]
+        ).reset_index(drop=True)
+
+        # CSV export
+        output = StringIO()
+        for group, group_df in filtered_df.groupby("Weight Group"):
+            group_df = group_df.sort_values(
+                by=["Zero_Qty_Flag", "Loose_Flag", "Batch"],
+                ascending=[True, False, True]
+            )
+
+            output.write(f"Weight Group: {group}\n\n")
+            group_df_export = group_df[[
+                "Weight Group", "Batch", "Month",
+                "Quantity 2024", "Quantity 2025", "Quantity Difference",
+                "Value 2024", "Value 2025", "Value Difference"
+            ]]
+            group_df_export.to_csv(output, index=False)
+
+            totals = group_df_export[[
+                "Quantity 2024", "Quantity 2025", "Quantity Difference",
+                "Value 2024", "Value 2025", "Value Difference"
+            ]].sum().round(2)
+
+            total_row = ["", "TOTAL", ""] + totals.tolist()
+            output.write(",".join(map(str, total_row)) + "\n\n\n")
+
+        csv = output.getvalue().encode("utf-8")
+
+        # Clean up temp flags
+        filtered_df = filtered_df.drop(columns=["Loose_Flag", "Zero_Qty_Flag"])
+
+        # Display
+        st.subheader(f"📊 Quantity & Value Comparison for {selected_month}")
+        st.dataframe(filtered_df[[
+            "Weight Group", "Batch", "Month",
+            "Quantity 2024", "Quantity 2025", "Quantity Difference",
+            "Value 2024", "Value 2025", "Value Difference"
+        ]], use_container_width=True)
+
+        st.download_button(f"📥 Download {selected_month} Grouped CSV", data=csv,
+                           file_name=f"{selected_month.lower()}_grouped_comparison.csv",
+                           mime="text/csv")
+else:
+    st.info("Please upload a product sales PDF file.")
+
