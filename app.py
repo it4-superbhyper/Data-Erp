@@ -4,9 +4,16 @@ import fitz  # PyMuPDF
 import re
 import unicodedata
 from datetime import datetime
-from io import StringIO
+from io import StringIO, BytesIO
 
-# ---------- Updated Robust PDF Parser ----------
+# PDF ReportLab Imports
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import mm
+
+# ---------- PDF Parser ----------
 def extract_product_data_from_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     lines = []
@@ -24,47 +31,37 @@ def extract_product_data_from_pdf(pdf_bytes):
 
     while i < len(lines):
         line = lines[i].strip()
-
-        if re.match(r"[A-Z].*\d+[Xx]\d+", line):  # Likely a product name
+        if re.match(r"[A-Z].*\d+[Xx]\d+", line):
             name = line.strip()
             i += 1
-
             while i < len(lines) and not lines[i].strip().startswith("2024 Q"):
                 i += 1
-            i += 1  # skip "2024 Q"
-
+            i += 1
             q2024 = []
             while i < len(lines) and len(q2024) < 12:
                 q2024 += list(map(int, re.findall(r"\d+", lines[i])))
                 i += 1
-
             while i < len(lines) and not lines[i].strip().startswith("V"):
                 i += 1
-            i += 1  # skip "V"
-
+            i += 1
             v2024 = []
             while i < len(lines) and len(v2024) < 12:
                 v2024 += list(map(float, re.findall(r"\d+\.\d+", lines[i])))
                 i += 1
-
             while i < len(lines) and not lines[i].strip().startswith("2025 Q"):
                 i += 1
-            i += 1  # skip "2025 Q"
-
+            i += 1
             q2025 = []
             while i < len(lines) and len(q2025) < 12:
                 q2025 += list(map(int, re.findall(r"\d+", lines[i])))
                 i += 1
-
             while i < len(lines) and not lines[i].strip().startswith("V"):
                 i += 1
-            i += 1  # skip "V"
-
+            i += 1
             v2025 = []
             while i < len(lines) and len(v2025) < 12:
                 v2025 += list(map(float, re.findall(r"\d+\.\d+", lines[i])))
                 i += 1
-
             batch_match = re.search(r"(\d+)[Xx](\d+(?:\.\d+)?)(KG|G|GR)?", name)
             if batch_match:
                 units, size, unit = batch_match.groups()
@@ -76,7 +73,6 @@ def extract_product_data_from_pdf(pdf_bytes):
                 unit = single_match.group(2) if single_match else "KG"
                 full_batch = f"{name} {size}{unit.upper()}"
                 weight_group = f"{size}{unit.upper()}"
-
             for j in range(12):
                 products.append({
                     "Product": name,
@@ -162,15 +158,12 @@ if uploaded_file:
             ascending=[True, True, False, True]
         ).reset_index(drop=True)
 
-        # ---------- CSV Export ----------
         def export_grouped_csv(df):
             output = StringIO()
-
             basmati_df = df[df["Basmati_Flag"]]
             non_basmati_df = df[~df["Basmati_Flag"]]
 
             for group, group_df in non_basmati_df.groupby("Weight Group"):
-                group_df = group_df.sort_values(by=["Zero_Qty_Flag", "Loose_Flag", "Batch"], ascending=[True, False, True])
                 output.write(f"Weight Group: {group}\n\n")
                 export_df = group_df[[
                     "Weight Group", "Batch", "Month",
@@ -178,7 +171,6 @@ if uploaded_file:
                     "Value 2024", "Value 2025", "Value Difference"
                 ]]
                 export_df.to_csv(output, index=False)
-
                 totals = export_df[[
                     "Quantity 2024", "Quantity 2025", "Quantity Difference",
                     "Value 2024", "Value 2025", "Value Difference"
@@ -187,15 +179,13 @@ if uploaded_file:
                 output.write(",".join(map(str, total_row)) + "\n\n\n")
 
             if not basmati_df.empty:
-                group_df = basmati_df.sort_values(by=["Weight Group", "Zero_Qty_Flag", "Loose_Flag", "Batch"])
-                output.write(f"BASMATI GROUP\n\n")
-                export_df = group_df[[
+                output.write("BASMATI GROUP\n\n")
+                export_df = basmati_df[[
                     "Weight Group", "Batch", "Month",
                     "Quantity 2024", "Quantity 2025", "Quantity Difference",
                     "Value 2024", "Value 2025", "Value Difference"
                 ]]
                 export_df.to_csv(output, index=False)
-
                 totals = export_df[[
                     "Quantity 2024", "Quantity 2025", "Quantity Difference",
                     "Value 2024", "Value 2025", "Value Difference"
@@ -205,7 +195,71 @@ if uploaded_file:
 
             return output.getvalue().encode("utf-8")
 
+        def export_grouped_pdf(df, selected_month):
+            buffer = BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), leftMargin=10*mm, rightMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm)
+            styles = getSampleStyleSheet()
+            story = []
+
+            basmati_df = df[df["Basmati_Flag"]]
+            non_basmati_df = df[~df["Basmati_Flag"]]
+
+            def add_group(title, group_df):
+                story.append(Paragraph(title, styles['Heading2']))
+                grouped = group_df.groupby("Weight Group")
+
+                for group, gdf in grouped:
+                    story.append(Spacer(1, 6))
+                    story.append(Paragraph(f"Weight Group: {group}", styles['Heading3']))
+
+                    table_data = [[
+                        "Weight Group", "Batch", "Month",
+                        "Qty 2024", "Qty 2025", "Diff",
+                        "Val 2024", "Val 2025", "Diff"
+                    ]]
+
+                    for _, row in gdf.iterrows():
+                        table_data.append([
+                            row["Weight Group"], row["Batch"], row["Month"],
+                            int(row["Quantity 2024"]), int(row["Quantity 2025"]), int(row["Quantity Difference"]),
+                            f"{row['Value 2024']:.2f}", f"{row['Value 2025']:.2f}", f"{row['Value Difference']:.2f}"
+                        ])
+
+                    totals = gdf[[
+                        "Quantity 2024", "Quantity 2025", "Quantity Difference",
+                        "Value 2024", "Value 2025", "Value Difference"
+                    ]].sum().round(2).tolist()
+                    total_row = ["", "TOTAL", ""] + list(map(str, totals))
+                    table_data.append(total_row)
+
+                    col_widths = [35*mm, 60*mm, 25*mm, 20*mm, 20*mm, 20*mm, 25*mm, 25*mm, 25*mm]
+                    table = Table(table_data, colWidths=col_widths, repeatRows=1)
+
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('GRID', (0, 0), (-1, -1), 0.25, colors.black),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                        ('FONTSIZE', (0, 0), (-1, -1), 7),
+                        ('ALIGN', (3, 1), (-1, -1), 'RIGHT'),
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 5),
+                        ('TOPPADDING', (0, 1), (-1, -1), 2),
+                    ]))
+
+                    story.append(table)
+                    story.append(Spacer(1, 18))
+
+            add_group(f"📦 Sales Comparison - {selected_month}", non_basmati_df)
+            if not basmati_df.empty:
+                add_group("🍚 BASMATI GROUP", basmati_df)
+
+            doc.build(story)
+            return buffer.getvalue()
+
         csv_bytes = export_grouped_csv(filtered_df)
+        pdf_bytes = export_grouped_pdf(filtered_df, selected_month)
 
         filtered_df = filtered_df.drop(columns=["Loose_Flag", "Zero_Qty_Flag", "Basmati_Flag"])
 
@@ -223,5 +277,11 @@ if uploaded_file:
             mime="text/csv"
         )
 
+        st.download_button(
+            f"📄 Download {selected_month} Grouped PDF",
+            data=pdf_bytes,
+            file_name=f"{selected_month.lower()}_grouped_comparison.pdf",
+            mime="application/pdf"
+        )
 else:
     st.info("Please upload a product sales PDF file.")
